@@ -44,7 +44,7 @@ import (
 // ================================ Background ===========================================
 
 const (
-	chanCap = 256
+	chanCap = 1024
 	LowWM   = 60
 	HighWM  = 80
 )
@@ -54,9 +54,7 @@ const (
 	atimeGet   = "get"
 )
 
-//================================= Global Variables ==========================================
-// atimeSyncTime is used to determine how often flushes occur.
-var atimeSyncTime = time.Minute * 3
+var atimeSyncTime = time.Minute * 2 // TODO: adjust at runtime
 
 //
 // API types

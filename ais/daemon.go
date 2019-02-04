@@ -158,7 +158,7 @@ func dryinit() {
 	if dryRun.disk {
 		warning := "Dry-run: disk IO will be disabled"
 		fmt.Fprintf(os.Stderr, "%s\n", warning)
-		glog.Infof("%s - in memory file size: %d (%s) bytes", warning, dryRun.size, cmn.B2S(dryRun.size, 0))
+		glog.Infof("%s - in memory file size: %d (%s) bytes", warning, dryRun.size, dryRun.sizeStr)
 	}
 	if dryRun.network {
 		warning := "Dry-run: GET won't return objects, PUT won't send objects"
@@ -217,7 +217,7 @@ func aisinit(version, build string) {
 		t := &targetrunner{}
 		t.initSI()
 		ctx.rg.add(t, xtarget)
-		ts := &stats.Trunner{TargetRunner: t} // iostat below
+		ts := &stats.Trunner{T: t} // iostat below
 		ts.Init()
 		ctx.rg.add(ts, xstorstats)
 		_ = t.initStatsD("aistarget")
@@ -255,7 +255,7 @@ func aisinit(version, build string) {
 				glog.Fatal(err)
 			}
 		}
-		ts.UpdateCapacity() // goes after fs.Mountpaths.Init
+		_ = ts.UpdateCapacityOOS() // goes after fs.Mountpaths.Init
 
 		iostat := ios.NewIostatRunner()
 		ctx.rg.add(iostat, xiostat)

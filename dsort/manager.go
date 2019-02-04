@@ -57,11 +57,14 @@ var (
 		}
 		go mem.Run()
 	}
+
+	_ cluster.Slistener = &Manager{}
 )
 
 type dsortContext struct {
 	smap       cluster.Sowner
 	node       *cluster.Snode
+	t          cluster.Target
 	nameLocker cluster.NameLocker
 }
 
@@ -70,6 +73,7 @@ type dsortContext struct {
 type progressState struct {
 	inProgress bool
 	aborted    bool
+	cleaned    int32
 	wg         *sync.WaitGroup
 	// doneCh is closed when the job is aborted so that goroutines know when
 	// they need to stop.
@@ -90,8 +94,9 @@ type Manager struct {
 	ManagerUUID string   `json:"manager_uuid"`
 	Metrics     *Metrics `json:"metrics"`
 
-	mu  sync.Mutex
-	ctx dsortContext
+	mu   sync.Mutex
+	ctx  dsortContext
+	smap *cluster.Smap
 
 	recManager         *extract.RecordManager
 	shardManager       *extract.ShardManager
@@ -130,6 +135,10 @@ type Manager struct {
 		mu      sync.Mutex
 		writers map[string]*streamWriter
 	}
+	finishedAck struct {
+		mu sync.Mutex
+		m  map[string]struct{} // finished acks: daemonID -> ack
+	}
 
 	callTimeout time.Duration // Maximal time we will wait for other node to respond
 }
@@ -138,9 +147,10 @@ type Manager struct {
 // a contentPath aka recordPath and fullPath.
 type contentPathFunc func(string, string) (string, string)
 
-func RegisterNode(smap cluster.Sowner, snode *cluster.Snode, nameLocker cluster.NameLocker) {
+func RegisterNode(smap cluster.Sowner, snode *cluster.Snode, t cluster.Target, nameLocker cluster.NameLocker) {
 	ctx.smap = smap
 	ctx.node = snode
+	ctx.t = t
 	ctx.nameLocker = nameLocker
 }
 
@@ -152,8 +162,12 @@ func (m *Manager) init(rs *ParsedRequestSpec) error {
 	// time some manager will be initialized.
 	once.Do(initOnce)
 
+	// smap, nameLocker setup
 	m.ctx = ctx
-	targetCount := m.ctx.smap.Get().CountTargets()
+	m.smap = m.ctx.smap.Get()
+	m.ctx.smap.Listeners().Reg(m)
+	targetCount := m.smap.CountTargets()
+
 	m.rs = rs
 	m.Metrics = newMetrics(rs.ExtendedMetrics)
 	m.startShardCreation = make(chan struct{}, 1)
@@ -209,6 +223,14 @@ func (m *Manager) init(rs *ParsedRequestSpec) error {
 	m.streams.request = make(map[string]*StreamPool, 100)
 	m.streams.response = make(map[string]*StreamPool, 100)
 	m.streams.shards = make(map[string]*StreamPool, 100)
+
+	// Fill ack map with current daemons. Once the finished ack is received from
+	// another daemon we will remove it from the map until len(ack) == 0 (then
+	// we will know that all daemons have finished operation).
+	m.finishedAck.m = make(map[string]struct{}, targetCount)
+	for sid := range m.smap.Tmap {
+		m.finishedAck.m[sid] = struct{}{}
+	}
 
 	m.setInProgressTo(true)
 	m.setAbortedTo(false)
@@ -271,12 +293,62 @@ func (m *Manager) initStreams() error {
 	return nil
 }
 
+func (m *Manager) cleanupStreams() error {
+	config := cmn.GCO.Get()
+	reqNetwork := cmn.NetworkIntraControl
+	if !config.Net.UseIntraControl {
+		reqNetwork = cmn.NetworkPublic
+	}
+	// Responses to the other targets are objects that is why we want to use
+	// intraData network.
+	respNetwork := cmn.NetworkIntraData
+	if !config.Net.UseIntraData {
+		respNetwork = cmn.NetworkPublic
+	}
+
+	if len(m.streams.request) > 0 {
+		trname := fmt.Sprintf("dsort-%s-recv_req", m.ManagerUUID)
+		if err := transport.Unregister(reqNetwork, trname); err != nil {
+			return err
+		}
+	}
+
+	if len(m.streams.response) > 0 {
+		trname := fmt.Sprintf("dsort-%s-recv_resp", m.ManagerUUID)
+		if err := transport.Unregister(respNetwork, trname); err != nil {
+			return err
+		}
+	}
+
+	if len(m.streams.shards) > 0 {
+		trname := fmt.Sprintf("dsort-%s-shard", m.ManagerUUID)
+		if err := transport.Unregister(respNetwork, trname); err != nil {
+			return err
+		}
+	}
+
+	for _, streamPoolArr := range []map[string]*StreamPool{m.streams.request, m.streams.response, m.streams.shards} {
+		for _, streamPool := range streamPoolArr {
+			streamPool.Stop()
+		}
+	}
+
+	m.streams.request = nil
+	m.streams.response = nil
+	m.streams.shards = nil
+	return nil
+}
+
 // cleanup removes all memory allocated and removes all files created during sort run.
 //
 // PRECONDITION: manager must be not in progress state (either actual finish or abort).
 //
 // NOTE: If cleanup is invoked during the run it is treated as abort.
 func (m *Manager) cleanup() {
+	if !atomic.CompareAndSwapInt32(&m.state.cleaned, 0, 1) {
+		return // do not clean if already scheduled
+	}
+
 	m.lock()
 	glog.Infof("dsort %s has started a cleanup", m.ManagerUUID)
 	now := time.Now()
@@ -288,14 +360,6 @@ func (m *Manager) cleanup() {
 
 	cmn.Assert(!m.inProgress(), fmt.Sprintf("%s: was still in progress", m.ManagerUUID))
 
-	for _, streamPoolArr := range []map[string]*StreamPool{m.streams.request, m.streams.response, m.streams.shards} {
-		for _, streamPool := range streamPoolArr {
-			streamPool.Stop()
-		}
-	}
-	m.streams.request = nil
-	m.streams.response = nil
-	m.streams.shards = nil
 	m.streamWriters.writers = nil
 
 	m.recManager.Cleanup()
@@ -303,6 +367,27 @@ func (m *Manager) cleanup() {
 	m.extractCreator = nil
 	extract.FreeMemory()
 	m.client = nil
+
+	m.ctx.smap.Listeners().Unreg(m)
+
+	if !m.aborted() {
+		m.updateFinishedAck(m.ctx.node.DaemonID)
+	}
+}
+
+// finalCleanup is invoked only when all the target confirmed finishing the
+// dSort operations. To ensure that finalCleanup is not invoked before regular
+// cleanup is finished, we also ack ourselves.
+func (m *Manager) finalCleanup() {
+	if !atomic.CompareAndSwapInt32(&m.state.cleaned, 1, 2) {
+		return // do not clean if already scheduled
+	}
+
+	if err := m.cleanupStreams(); err != nil {
+		glog.Error(err)
+	}
+	m.finishedAck.m = nil
+	Managers.persist(m.ManagerUUID)
 }
 
 // abort stops currently running sort job and frees associated resources.
@@ -316,7 +401,10 @@ func (m *Manager) abort() {
 		m.waitForFinish()
 	}
 
-	go m.cleanup()
+	go func() {
+		m.cleanup()
+		m.finalCleanup() // on abort always perform final cleanup
+	}()
 }
 
 // setExtractCreator sets what type of file extraction and creation is used based on the RequestSpec.
@@ -348,6 +436,17 @@ func (m *Manager) setExtractCreator() (err error) {
 	}
 
 	return nil
+}
+
+// updateFinishedAck marks daemonID as finished. If all daemons ack then the
+// finalCleanup is dispatched in separate goroutine.
+func (m *Manager) updateFinishedAck(daemonID string) {
+	m.finishedAck.mu.Lock()
+	delete(m.finishedAck.m, daemonID)
+	if len(m.finishedAck.m) == 0 {
+		go m.finalCleanup()
+	}
+	m.finishedAck.mu.Unlock()
 }
 
 // incrementReceived increments number of received records batches. Also puts
@@ -399,7 +498,7 @@ func (m *Manager) decrementRef(by int64) {
 		m.lock()
 		if !m.inProgress() {
 			m.unlock()
-			go Managers.persist(m.ManagerUUID, true /*cleanup*/)
+			go m.cleanup()
 			return
 		}
 		m.unlock()
@@ -452,7 +551,7 @@ func (m *Manager) setInProgressTo(inProgress bool) {
 func (m *Manager) setAbortedTo(aborted bool) {
 	if aborted {
 		// If not finished and not yet aborted we should mark that we will wait.
-		if m.inProgress() && !m.state.aborted {
+		if m.inProgress() && !m.aborted() {
 			close(m.state.doneCh)
 			m.state.wg.Add(1)
 		}
@@ -562,7 +661,7 @@ func (m *Manager) makeRecvRequestFunc() transport.Receive {
 	}
 
 	return func(w http.ResponseWriter, hdr transport.Header, object io.Reader, err error) {
-		fromNode := m.ctx.smap.Get().Tmap[string(hdr.Opaque)]
+		fromNode := m.smap.GetTarget(string(hdr.Opaque))
 		if err != nil {
 			errHandler(err, hdr, fromNode)
 			return
@@ -713,7 +812,7 @@ func (m *Manager) loadContent() extract.LoadContentFunc {
 					Objname: pathToContents,
 					Opaque:  []byte(m.ctx.node.DaemonID),
 				}
-				toNode = m.ctx.smap.Get().Tmap[daemonID]
+				toNode = m.smap.GetTarget(daemonID)
 			)
 
 			if m.Metrics.extended {
@@ -833,4 +932,20 @@ func (m *Manager) doWithAbort(method, u string, body []byte, w io.Writer) (int64
 
 	close(errCh)
 	return n, <-errCh
+}
+
+// SmapChanged implements Slistener interface
+func (m *Manager) SmapChanged() {
+	newSmap := m.ctx.smap.Get()
+	// check if some target has been removed - abort in case it does
+	for sid := range m.smap.Tmap {
+		if newSmap.GetTarget(sid) == nil {
+			go m.abort() // FIXME: once the smap notification logic will change we could remove `go`
+			return
+		}
+	}
+}
+
+func (m *Manager) String() string {
+	return m.ManagerUUID
 }

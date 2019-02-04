@@ -45,6 +45,7 @@ cat > $CONFFILE <<EOL
 	"lru_config": {
 		"lowwm":		75,
 		"highwm":		90,
+		"out_of_space":		95,
 		"atime_cache_max":	65536,
 		"dont_evict_time":	"120m",
 		"capacity_upd_time":	"10m",
@@ -60,10 +61,11 @@ cat > $CONFFILE <<EOL
 		"rebalancing_enabled": 	true
 	},
 	"cksum_config": {
-		"checksum":                    "xxhash",
-		"validate_checksum_cold_get":  true,
-		"validate_checksum_warm_get":  false,
-		"enable_read_range_checksum":  false
+		"checksum":                   "xxhash",
+		"validate_checksum_cold_get": true,
+		"validate_checksum_warm_get": false,
+		"validate_cluster_migration": false,
+		"enable_read_range_checksum": false
 	},
 	"version_config": {
 		"validate_version_warm_get":    false,
@@ -109,14 +111,16 @@ cat > $CONFFILE <<EOL
 	"keepalivetracker": {
 		"proxy": {
 			"interval": "10s",
-			"name": "heartbeat",
-			"factor": 3
+			"name":     "heartbeat",
+			"factor":   3
 		},
 		"target": {
 			"interval": "10s",
-			"name": "heartbeat",
-			"factor": 3
-		}
+			"name":     "heartbeat",
+			"factor":   3
+		},
+		"retry_factor":   5,
+		"timeout_factor": 3
 	}
 }
 EOL

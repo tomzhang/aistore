@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/ioutil"
 	"net"
@@ -42,13 +43,17 @@ import (
 	"github.com/NVIDIA/aistore/stats"
 	"github.com/NVIDIA/aistore/stats/statsd"
 	"github.com/NVIDIA/aistore/transport"
+	"github.com/OneOfOne/xxhash"
 	jsoniter "github.com/json-iterator/go"
 )
 
 const (
-	internalPageSize = 10000     // number of objects in a page for internal call between target and proxy to get atime/iscached
-	MaxPageSize      = 64 * 1024 // max number of objects in a page (warning logged if requested page size exceeds this limit)
-	maxBytesInMem    = 256 * cmn.KiB
+	maxPageSize   = 64 * 1024     // max number of objects in a page (warning logged if requested page size exceeds this limit)
+	maxBytesInMem = 256 * cmn.KiB // objects with smaller size than this will be read to memory when checksumming
+
+	// GET: when object is missing and rebalance is running we schedule couple of retries.
+	restoreMissingRetries   = 10
+	restoreMissingIntervals = 300 * time.Millisecond
 )
 
 type (
@@ -98,11 +103,19 @@ type (
 		// Determines if the object was already in cluster and was received
 		// because some kind of migration.
 		migrated bool
-		r        io.Reader       // reader of the object
-		cksumVal cmn.CksumValue  // checksum value of the object
-		ctx      context.Context // context used when receiving object which is contained in cloud bucket
+		// Determines if the recv is cold recv: either from another cluster or cloud.
+		cold bool
 
-		// internal
+		// Reader with the content of the object.
+		r io.ReadCloser
+		// Checksum which needs to be checked on receive. It is only checked
+		// on specific occasions: see `writeToFile` method.
+		cksumToCheck cmn.CksumValue
+		// Context used when receiving object which is contained in cloud bucket.
+		// It usually contains credentials to access the cloud.
+		ctx context.Context
+
+		// INTERNAL
 
 		// FQN which is used only temporarily for receiving file. After
 		// successful receive is renamed to actual FQN.
@@ -118,16 +131,16 @@ type (
 		rtnamemap      *rtnamemap
 		prefetchQueue  chan filesWithDeadline
 		authn          *authManager
-		clusterStarted int64
-		regstate       regstate // registration state - the state of being registered (with the proxy), or maybe not
+		clusterStarted int32
+		oos            int32 // out of space
 		fsprg          fsprungroup
 		readahead      readaheader
 		xcopy          *mirror.XactCopy
 		ecmanager      *ecManager
-
-		streams struct {
-			rebalance *cluster.StreamBundle
+		streams        struct {
+			rebalance *transport.StreamBundle
 		}
+		regstate regstate // the state of being registered with the primary proxy, or maybe not
 	}
 )
 
@@ -215,6 +228,7 @@ func (t *targetrunner) Run() error {
 	// Public network
 	t.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Buckets)+"/", t.bucketHandler)
 	t.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Objects)+"/", t.objectHandler)
+	t.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Download), t.downloadHandler)
 	t.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Daemon), t.daemonHandler)
 	t.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Push)+"/", t.pushHandler)
 	t.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Tokens), t.tokenHandler)
@@ -228,6 +242,7 @@ func (t *targetrunner) Run() error {
 	t.registerIntraControlNetHandler(cmn.URLPath(cmn.Version, cmn.Sort), dsort.SortHandler)
 	if config.Net.UseIntraControl {
 		transport.SetMux(cmn.NetworkIntraControl, t.intraControlServer.mux) // to register transport handlers at runtime
+		t.registerIntraControlNetHandler(cmn.URLPath(cmn.Version, cmn.Download), t.downloadHandler)
 		t.registerIntraControlNetHandler("/", cmn.InvalidHandler)
 	}
 
@@ -263,7 +278,7 @@ func (t *targetrunner) Run() error {
 		go runLocalRebalanceOnce.Do(f) // only once at startup
 	}
 
-	dsort.RegisterNode(t.smapowner, t.si, t.rtnamemap)
+	dsort.RegisterNode(t.smapowner, t.si, t, t.rtnamemap)
 	return t.httprunner.run()
 }
 
@@ -296,7 +311,7 @@ func (t *targetrunner) setupStreams() error {
 		ExpectContinueTimeout: defaultTransport.ExpectContinueTimeout,
 		MaxIdleConnsPerHost:   ncpu,
 	}}
-	t.streams.rebalance = cluster.NewStreamBundle(t.smapowner, t.si, client, network, "rebalance", nil, cluster.Targets, ncpu)
+	t.streams.rebalance = transport.NewStreamBundle(t.smapowner, t.si, client, network, "rebalance", nil, cluster.Targets, ncpu)
 	return nil
 }
 
@@ -399,6 +414,18 @@ func (t *targetrunner) unregister() (int, error) {
 // implements cluster.Target interfaces
 var _ cluster.Target = &targetrunner{}
 
+func (t *targetrunner) OOS(oos ...bool) bool {
+	if len(oos) > 0 {
+		var v int32
+		if oos[0] {
+			v = 2019
+		}
+		atomic.StoreInt32(&t.oos, v)
+		return v != 0
+	}
+	return atomic.LoadInt32(&t.oos) != 0
+}
+
 func (t *targetrunner) IsRebalancing() bool {
 	_, running := t.xactions.isAbortedOrRunningRebalance()
 	_, runningLocal := t.xactions.isAbortedOrRunningLocalRebalance()
@@ -469,6 +496,17 @@ func (t *targetrunner) GetAtimeRunner() *atime.Runner { return getatimerunner() 
 func (t *targetrunner) GetMem2() *memsys.Mem2         { return gmem2 }
 func (t *targetrunner) GetFSPRG() fs.PathRunGroup     { return &t.fsprg }
 
+func (t *targetrunner) Receive(workFQN string, reader io.ReadCloser, lom *cluster.LOM) error {
+	roi := &recvObjInfo{
+		t:       t,
+		r:       reader,
+		workFQN: workFQN,
+		lom:     lom,
+	}
+	err, _ := roi.recv()
+	return err
+}
+
 //===========================================================================================
 //
 // http handlers: data and metadata
@@ -526,6 +564,24 @@ func (t *targetrunner) httpbckget(w http.ResponseWriter, r *http.Request) {
 	}
 	s := fmt.Sprintf("Invalid route /buckets/%s", bucket)
 	t.invalmsghdlr(w, r, s)
+}
+
+// verifyProxyRedirection returns if the http request was redirected from a proxy
+func (t *targetrunner) verifyProxyRedirection(w http.ResponseWriter, r *http.Request, bucket, objname, action string) bool {
+	query := r.URL.Query()
+	pid := query.Get(cmn.URLParamProxyID)
+	if pid == "" {
+		t.invalmsghdlr(w, r, fmt.Sprintf("%s %s requests are expected to be redirected", r.Method, action))
+		return false
+	}
+	if t.smapowner.get().GetProxy(pid) == nil {
+		t.invalmsghdlr(w, r, fmt.Sprintf("%s %s request from an unknown proxy/gateway ID '%s' - Smap out of sync?", r.Method, action, pid))
+		return false
+	}
+	if glog.V(4) {
+		glog.Infof("%s %s %s/%s <= %s", r.Method, action, bucket, objname, pid)
+	}
+	return true
 }
 
 // GET /v1/objects/bucket[+"/"+objname]
@@ -596,7 +652,10 @@ func (t *targetrunner) httpobjget(w http.ResponseWriter, r *http.Request) {
 			t.invalmsghdlr(w, r, errstr)
 			return
 		}
-	} else if lom.Bislocal { // does not exist in the local bucket: restore from neighbors
+
+		// does not exist in the local bucket: restore from neighbors
+		// Need to check if dryrun is enabled to stop from getting LOM
+	} else if lom.Bislocal && !dryRun.disk && !dryRun.network {
 		if errstr, errcode = t.restoreObjLocalBucket(lom, r); errstr == "" {
 			t.objGetComplete(w, r, lom, started, rangeOff, rangeLen, false)
 			t.rtnamemap.Unlock(lom.Uname, false)
@@ -641,7 +700,7 @@ func (t *targetrunner) httpobjget(w http.ResponseWriter, r *http.Request) {
 	//
 	// 3. coldget
 	//
-	if coldget && !dryRun.disk {
+	if coldget && !dryRun.disk && !dryRun.network {
 		t.rtnamemap.Unlock(lom.Uname, false)
 		if errstr, errcode := t.getCold(ct, lom, false); errstr != "" {
 			t.invalmsghdlr(w, r, errstr, errcode)
@@ -678,12 +737,17 @@ func (t *targetrunner) restoreObjLocalBucket(lom *cluster.LOM, r *http.Request) 
 	// check cluster-wide when global rebalance is running
 	aborted, running = t.xactions.isAbortedOrRunningRebalance()
 	if aborted || running {
-		if props, errs := t.getFromNeighbor(r, lom); errs == "" {
-			lom.RestoredReceived(props)
-			if glog.V(4) {
-				glog.Infof("Restored (global rebalance in-progress?): %s (%s)", lom, cmn.B2S(lom.Size, 1))
+		// Do couple of retries in case the object was moved or is being moved right now.
+		for retry := 0; retry < restoreMissingRetries; retry++ {
+			if props, errs := t.getFromNeighbor(r, lom); errs == "" {
+				lom.RestoredReceived(props)
+				if glog.V(4) {
+					glog.Infof("Restored (global rebalance in-progress?): %s (%s)", lom, cmn.B2S(lom.Size, 1))
+				}
+				return
 			}
-			return
+
+			time.Sleep(restoreMissingIntervals)
 		}
 	} else {
 		if lom.Bprops != nil && lom.Bprops.NextTierURL != "" {
@@ -916,16 +980,11 @@ func (t *targetrunner) httpobjput(w http.ResponseWriter, r *http.Request) {
 		t.statsif.Add(stats.PutRedirLatency, redelta)
 	}
 	// PUT
-	pid := query.Get(cmn.URLParamProxyID)
-	if glog.V(4) {
-		glog.Infof("%s %s/%s <= %s", r.Method, bucket, objname, pid)
-	}
-	if pid == "" {
-		t.invalmsghdlr(w, r, "PUT requests are expected to be redirected")
+	if !t.verifyProxyRedirection(w, r, bucket, objname, cmn.Objects) {
 		return
 	}
-	if t.smapowner.get().GetProxy(pid) == nil {
-		t.invalmsghdlr(w, r, fmt.Sprintf("PUT from an unknown proxy/gateway ID '%s' - Smap out of sync?", pid))
+	if t.OOS() {
+		t.invalmsghdlr(w, r, "OOS")
 		return
 	}
 
@@ -1230,6 +1289,8 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 	hdr.Add(cmn.HeaderBucketAtimeCacheMax, strconv.FormatInt(props.AtimeCacheMax, 10))
 	hdr.Add(cmn.HeaderBucketDontEvictTime, props.DontEvictTimeStr)
 	hdr.Add(cmn.HeaderBucketCapUpdTime, props.CapacityUpdTimeStr)
+	hdr.Add(cmn.HeaderBucketMirrorEnabled, strconv.FormatBool(props.MirrorEnabled))
+	hdr.Add(cmn.HeaderBucketMirrorThresh, strconv.FormatInt(props.MirrorUtilThresh, 10))
 	hdr.Add(cmn.HeaderBucketLRUEnabled, strconv.FormatBool(props.LRUEnabled))
 	if props.MirrorEnabled {
 		hdr.Add(cmn.HeaderBucketCopies, strconv.FormatInt(props.MirrorConf.Copies, 10))
@@ -1575,12 +1636,19 @@ func (t *targetrunner) getFromNeighbor(r *http.Request, lom *cluster.LOM) (rlom 
 	*rlom = *lom
 	rlom.Nhobj = hksum
 	rlom.Version = version
-	if err = t.receive(workFQN, response.Body, rlom, ""); err != nil { // FIXME: transfer atime as well
-		response.Body.Close()
+
+	roi := &recvObjInfo{
+		t:        t,
+		workFQN:  workFQN,
+		migrated: true,
+		r:        response.Body,
+		lom:      rlom,
+	}
+
+	if err = roi.writeToFile(); err != nil { // FIXME: transfer atime as well
 		errstr = err.Error()
 		return
 	}
-	response.Body.Close()
 	// commit
 	if err = cmn.MvFile(workFQN, rlom.Fqn); err != nil {
 		errstr = err.Error()
@@ -2129,18 +2197,18 @@ func (ci *allfinfos) listwalkf(fqn string, osfi os.FileInfo, err error) error {
 // In both case a new checksum is saved to xattrs
 func (t *targetrunner) doPut(r *http.Request, bucket, objname string) (err error, errcode int) {
 	var (
-		cksumType = r.Header.Get(cmn.HeaderObjCksumType)
-		cksum     = r.Header.Get(cmn.HeaderObjCksumVal)
-		cksumVal  = cmn.NewCksum(cksumType, cksum)
+		cksumType  = r.Header.Get(cmn.HeaderObjCksumType)
+		cksumValue = r.Header.Get(cmn.HeaderObjCksumVal)
+		cksum      = cmn.NewCksum(cksumType, cksumValue)
 	)
 
 	roi := &recvObjInfo{
-		t:        t,
-		objname:  objname,
-		bucket:   bucket,
-		ctx:      t.contextWithAuth(r),
-		r:        r.Body,
-		cksumVal: cksumVal,
+		t:            t,
+		objname:      objname,
+		bucket:       bucket,
+		r:            r.Body,
+		cksumToCheck: cksum,
+		ctx:          t.contextWithAuth(r),
 	}
 	if err := roi.init(); err != nil {
 		return err, http.StatusInternalServerError
@@ -2187,7 +2255,7 @@ func (roi *recvObjInfo) init() error {
 
 	// All objects which are migrated should contain checksum.
 	if roi.migrated {
-		cmn.Assert(roi.cksumVal != nil)
+		cmn.Assert(roi.cksumToCheck != nil)
 	}
 
 	return nil
@@ -2199,16 +2267,15 @@ func (roi *recvObjInfo) recv() (err error, errCode int) {
 	// optimize out if the checksums do match
 	if roi.lom.Exists() {
 		if errstr := roi.lom.Fill(cluster.LomCksum); errstr == "" {
-			if cmn.EqCksum(roi.lom.Nhobj, roi.cksumVal) {
+			if cmn.EqCksum(roi.lom.Nhobj, roi.cksumToCheck) {
 				glog.Infof("Existing %s is valid: PUT is a no-op", roi.lom)
 				io.Copy(ioutil.Discard, roi.r) // drain the reader
 				return nil, 0
 			}
 		}
 	}
-	roi.lom.Nhobj = roi.cksumVal
 
-	if err = roi.t.receive(roi.workFQN, roi.r, roi.lom, ""); err != nil {
+	if err = roi.writeToFile(); err != nil {
 		return err, http.StatusInternalServerError
 	}
 
@@ -2258,6 +2325,7 @@ func (roi *recvObjInfo) tryCommit() (errstr string, errCode int) {
 			errstr = fmt.Sprintf("Failed to open %s err: %v", roi.workFQN, err)
 			return
 		} else {
+			cmn.Assert(roi.lom.Nhobj != nil)
 			roi.lom.Version, errstr, errCode = getcloudif().putobj(roi.ctx, file, roi.lom.Bucket, roi.lom.Objname, roi.lom.Nhobj)
 			file.Close()
 			if errstr != "" {
@@ -2327,12 +2395,12 @@ func (t *targetrunner) recvRebalanceObj(w http.ResponseWriter, hdr transport.Hea
 	}
 
 	roi := &recvObjInfo{
-		t:        t,
-		objname:  hdr.Objname,
-		bucket:   hdr.Bucket,
-		r:        objReader,
-		migrated: true,
-		cksumVal: cmn.NewCksum(hdr.ObjAttrs.CksumType, hdr.ObjAttrs.Cksum),
+		t:            t,
+		objname:      hdr.Objname,
+		bucket:       hdr.Bucket,
+		migrated:     true,
+		r:            ioutil.NopCloser(objReader),
+		cksumToCheck: cmn.NewCksum(hdr.ObjAttrs.CksumType, hdr.ObjAttrs.Cksum),
 	}
 	if err := roi.init(); err != nil {
 		glog.Error(err)
@@ -2864,13 +2932,12 @@ func (t *targetrunner) httpdaedelete(w http.ResponseWriter, r *http.Request) {
 //==============================================================================================
 
 // NOTE: LOM is updated on the end of the call with proper size and checksum.
-func (t *targetrunner) receive(workFQN string, reader io.Reader, lom *cluster.LOM, omd5 string) (err error) {
+// NOTE: `roi.r` is closed on the end of the call.
+func (roi *recvObjInfo) writeToFile() (err error) {
 	var (
-		file       *os.File
-		fileWriter = ioutil.Discard
-		written    int64
-		cksumVal   string
-		nhobj      cmn.CksumValue
+		file   *os.File
+		writer = ioutil.Discard
+		reader = roi.r
 	)
 
 	if dryRun.disk && dryRun.network {
@@ -2880,72 +2947,100 @@ func (t *targetrunner) receive(workFQN string, reader io.Reader, lom *cluster.LO
 		reader = readers.NewRandReader(dryRun.size)
 	}
 	if !dryRun.disk {
-		if file, err = cmn.CreateFile(workFQN); err != nil {
-			t.fshc(err, workFQN)
-			return fmt.Errorf("Failed to create %s, err: %s", workFQN, err)
+		if file, err = cmn.CreateFile(roi.workFQN); err != nil {
+			roi.t.fshc(err, roi.workFQN)
+			return fmt.Errorf("Failed to create %s, err: %s", roi.workFQN, err)
 		}
-		fileWriter = file
+		writer = file
 	}
 
 	buf, slab := gmem2.AllocFromSlab2(0)
 	defer func() { // free & cleanup on err
 		slab.Free(buf)
-
-		// Update LOM structure
-		lom.Size = written
-		lom.Nhobj = nhobj
+		reader.Close()
 
 		if err != nil && !dryRun.disk {
 			if nestedErr := file.Close(); nestedErr != nil {
-				glog.Errorf("Nested (%v): failed to close received object %s, err: %v", err, workFQN, nestedErr)
+				glog.Errorf("Nested (%v): failed to close received object %s, err: %v", err, roi.workFQN, nestedErr)
 			}
-			if nestedErr := os.Remove(workFQN); nestedErr != nil {
-				glog.Errorf("Nested (%v): failed to remove %s, err: %v", err, workFQN, nestedErr)
+			if nestedErr := os.Remove(roi.workFQN); nestedErr != nil {
+				glog.Errorf("Nested (%v): failed to remove %s, err: %v", err, roi.workFQN, nestedErr)
 			}
 		}
 	}()
 
 	if dryRun.disk || dryRun.network {
-		written, err = cmn.ReceiveAndChecksum(fileWriter, reader, buf)
-		return
+		_, err = cmn.ReceiveAndChecksum(writer, reader, buf)
+		return err
 	}
 
 	// receive and checksum
-	if lom.Cksumcfg.Checksum != cmn.ChecksumNone {
-		cmn.Assert(lom.Cksumcfg.Checksum == cmn.ChecksumXXHash)
-		if written, cksumVal, err = cmn.WriteWithHash(fileWriter, reader, buf); err != nil {
-			t.fshc(err, workFQN)
-			return
-		}
-		nhobj = cmn.NewCksum(cmn.ChecksumXXHash, cksumVal)
-		if lom.Nhobj != nil {
-			if !cmn.EqCksum(nhobj, lom.Nhobj) {
-				err = fmt.Errorf("%s; workFQN: %q", lom.BadChecksum(nhobj), workFQN)
-				t.statsif.AddMany(stats.NamedVal64{stats.ErrCksumCount, 1}, stats.NamedVal64{stats.ErrCksumSize, written})
-				return
+	var (
+		written int64
+
+		checkCksumType      string
+		expectedCksum       cmn.CksumValue
+		saveHash, checkHash hash.Hash
+		hashes              []hash.Hash
+	)
+
+	if !roi.cold && roi.lom.Cksumcfg.Checksum != cmn.ChecksumNone {
+		checkCksumType = roi.lom.Cksumcfg.Checksum
+		cmn.Assert(checkCksumType == cmn.ChecksumXXHash, checkCksumType)
+
+		if !roi.migrated || roi.lom.Cksumcfg.ValidateClusterMigration {
+			saveHash = xxhash.New64()
+			hashes = []hash.Hash{saveHash}
+
+			// if sender provided checksum we need to ensure that it is correct
+			if expectedCksum = roi.cksumToCheck; expectedCksum != nil {
+				checkHash = saveHash
+			}
+		} else {
+			// If migration validation is not required we can just take
+			// calculated checksum by some other node (from which we received
+			// the object). If not present we need to calculate it.
+			if roi.lom.Nhobj = roi.cksumToCheck; roi.lom.Nhobj == nil {
+				saveHash = xxhash.New64()
+				hashes = []hash.Hash{saveHash}
 			}
 		}
-	} else if omd5 != "" && lom.Cksumcfg.ValidateColdGet {
-		md5 := md5.New()
-		if written, err = cmn.ReceiveAndChecksum(fileWriter, reader, buf, md5); err != nil {
-			t.fshc(err, workFQN)
-			return
-		}
+	} else if roi.cold {
+		// by default we should calculate xxhash and save it together with file
+		saveHash = xxhash.New64()
+		hashes = []hash.Hash{saveHash}
 
-		md5Hash := cmn.HashToStr(md5)[:16]
-		if omd5 != md5Hash {
-			err = fmt.Errorf("Bad md5: %s; [%s != %s] workFQN: %q", lom, omd5, md5Hash, workFQN)
-			t.statsif.AddMany(stats.NamedVal64{stats.ErrCksumCount, 1}, stats.NamedVal64{stats.ErrCksumSize, written})
-			return
+		// if configured and the cksum is provied we should also check md5 hash (aws, gcp)
+		if roi.lom.Cksumcfg.ValidateColdGet && roi.cksumToCheck != nil {
+			expectedCksum = roi.cksumToCheck
+			checkCksumType, _ = expectedCksum.Get()
+			cmn.Assert(checkCksumType == cmn.ChecksumMD5, checkCksumType)
+
+			checkHash = md5.New()
+			hashes = append(hashes, checkHash)
 		}
-	} else {
-		if written, err = cmn.ReceiveAndChecksum(fileWriter, reader, buf); err != nil {
-			t.fshc(err, workFQN)
+	}
+
+	if written, err = cmn.ReceiveAndChecksum(writer, reader, buf, hashes...); err != nil {
+		roi.t.fshc(err, roi.workFQN)
+		return
+	}
+	roi.lom.Size = written
+
+	if checkHash != nil {
+		computedCksum := cmn.NewCksum(checkCksumType, cmn.HashToStr(checkHash))
+		if !cmn.EqCksum(expectedCksum, computedCksum) {
+			err = fmt.Errorf("Bad checksum expected %s, got: %s; workFQN: %q", expectedCksum.String(), computedCksum.String(), roi.workFQN)
+			roi.t.statsif.AddMany(stats.NamedVal64{stats.ErrCksumCount, 1}, stats.NamedVal64{stats.ErrCksumSize, written})
 			return
 		}
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("Failed to close received file %s, err: %v", workFQN, err)
+	if saveHash != nil {
+		roi.lom.Nhobj = cmn.NewCksum(cmn.ChecksumXXHash, cmn.HashToStr(saveHash))
+	}
+
+	if err = file.Close(); err != nil {
+		return fmt.Errorf("Failed to close received file %s, err: %v", roi.workFQN, err)
 	}
 	return nil
 }
@@ -3302,7 +3397,7 @@ func (t *targetrunner) receiveSmap(newsmap *smapX, msg *cmn.ActionMsg) (errstr s
 	}
 
 	glog.Infof("receiveSmap: newtargetid=%s", newtargetid)
-	if atomic.LoadInt64(&t.clusterStarted) != 0 {
+	if atomic.LoadInt32(&t.clusterStarted) != 0 {
 		go t.runRebalance(newsmap, newtargetid) // auto-rebalancing xaction
 		return
 	}
@@ -3317,7 +3412,7 @@ func (t *targetrunner) receiveSmap(newsmap *smapX, msg *cmn.ActionMsg) (errstr s
 		glog.Infoln("waiting for cluster startup to resume rebalance...")
 		for {
 			time.Sleep(time.Second)
-			if atomic.LoadInt64(&t.clusterStarted) != 0 {
+			if atomic.LoadInt32(&t.clusterStarted) != 0 {
 				break
 			}
 		}
@@ -3359,7 +3454,7 @@ func (t *targetrunner) pollClusterStarted() {
 			break
 		}
 	}
-	atomic.StoreInt64(&t.clusterStarted, 1)
+	atomic.StoreInt32(&t.clusterStarted, 1)
 	glog.Infoln("cluster started up")
 }
 

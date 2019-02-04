@@ -10,7 +10,7 @@
 
 ## Configuration
 
-AIStore configuration is consolidated in a single [JSON file](ais/setup/config.sh) where all of the knobs must be self-explanatory and the majority of those, except maybe just a few, have pre-assigned default values. The notable exceptions include:
+AIStore configuration is consolidated in a single [JSON file](../ais/setup/config.sh) where all of the knobs must be self-explanatory and the majority of those, except maybe just a few, have pre-assigned default values. The notable exceptions include:
 
 <img src="images/ais-config-1.png" alt="Configuration: TCP port and URL" width="600">
 
@@ -18,11 +18,13 @@ and
 
 <img src="images/ais-config-2-commented.png" alt="Configuration: local filesystems" width="600">
 
-As shown above, the `test_fspaths` section of the configuration corresponds to a **single local filesystem being partitioned** between both *local* and *Cloud* buckets. In other words, the `test_fspaths` configuration option is intended strictly for development. 
+As shown above, the `test_fspaths` section of the configuration corresponds to a **single local filesystem being partitioned** between both *local* and *Cloud* buckets. In other words, the `test_fspaths` configuration option is intended strictly for development.
 
-In production we use the an alternative configuration called `fspaths`: the section of the [config](ais/setup/config.sh) that includes a number of local directories, whereby each directory is based on a different local filesystem. 
+In production we use an alternative configuration called `fspaths`: the section of the [config](../ais/setup/config.sh) that includes a number of local directories, whereby each directory is based on a different local filesystem.
 
->> The terms `fspath` (aka `filesystem path`) and `mountpath` are used interchangeably throughout AIStore docs and sources. When `fspath` configuration is enabled, the 1-to-1 relationship between configured `mountpaths` and local filesystems is enforced and validated at all times.
+> Terminology: *mountpath* is a triplet **(local filesystem (LFS), disks that this LFS utilizes, LFS directory)**. The following rules are enforced: 1) different mountpaths use different LFSes, and 2) different LFSes use different disks.
+
+> The terms `fspath` (aka `filesystem path`) and `mountpath` are used interchangeably throughout AIStore docs and sources. When `fspath` configuration is enabled, the 1-to-1 relationship between configured `mountpaths` and local filesystems is enforced and validated at all times.
 
 An example of 12 fspaths (and 12 local filesystems) follows below:
 
@@ -54,8 +56,13 @@ Both a proxy and a storage target support the same set of runtime options but a 
 | validate_checksum_cold_get | true | Enables and disables checking the hash of received object after downloading it from the cloud or next tier |
 | validate_checksum_warm_get | false | If the option is enabled, AIStore checks the object's version (for a Cloud-based bucket), and an object's checksum. If any of the values(checksum and/or version) fail to match, the object is removed from local storage and (automatically) with its Cloud or next AIStore tier based version |
 | checksum | xxhash | Hashing algorithm used to check if the local object is corrupted. Value 'none' disables hash sum checking. Possible values are 'xxhash' and 'none' |
+| enable_read_range_checksum | false | Enables and disables checksum calculation for object slices. If enabled, it adds checksum to HTTP response header for the requested object byte range |
 | versioning | all | Defines what kind of buckets should use versioning to detect if the object must be redownloaded. Possible values are 'cloud', 'local', and 'all' |
+| validate_version_warm_get | false | If false, a target returns a requested object immediately if it is cached. If true, a target fetches object's version(via HEAD request) from Cloud and if the received version mismatches locally cached one, the target redownloads the object and then returns it to a client |
 | fschecker_enabled | true | Enables and disables filesystem health checker (FSHC) |
+| mirror_enabled | false | If true, for every object PUT a target creates object replica on another mountpath. Later, on object GET request, loadbalancer chooses a mountpath with lowest disk utilization and reads the object from it |
+| mirror_burst_buffer | 512 | the maximum length of queue of objects to be mirrored. When the queue length exceeds the value, a target may skip creating replicas for new objects |
+| mirror_util_thresh | 20 | If mirroring is enabled, loadbalancer chooses an object replica to read but only if main object's mountpath utilization exceeds the replica' s mountpath utilization by this value. Main object's mountpath is the mountpath used to store the object when mirroring is disabled |
 
 ### Managing filesystems
 
@@ -63,30 +70,30 @@ Configuration option `fspaths` specifies the list of local directories where sto
 
 NOTE: there must be a 1-to-1 relationship between `fspath` and an underlying local filesystem. Note as well that this may be not the case for the development environments where multiple mountpaths are allowed to coexist within a single filesystem (e.g., tmpfs).
 
-AIStore [HTTP API](docs/http_api.md) makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the AIStore built-in mechanism of object distribution. For further details about FSHC, please refer to [FSHC readme](health/fshc.md).
+AIStore [HTTP API](../docs/http_api.md) makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the AIStore built-in mechanism of object distribution. For further details about FSHC, please refer to [FSHC readme](../health/fshc.md).
 
 ### Disabling extended attributes
 
-To make sure that AIStore does not utilize xattrs, configure `checksum`=`none` and `versioning`=`none` for all targets in a AIStore cluster. This can be done via the [common configuration "part"](ais/setup/config.sh) that'd be further used to deploy the cluster.
+To make sure that AIStore does not utilize xattrs, configure `checksum`=`none` and `versioning`=`none` for all targets in a AIStore cluster. This can be done via the [common configuration "part"](../ais/setup/config.sh) that'd be further used to deploy the cluster.
 
 ### Enabling HTTPS
 
-To switch from HTTP protocol to an encrypted HTTPS, configure `use_https`=`true` and modify `server_certificate` and `server_key` values so they point to your OpenSSL cerificate and key files respectively (see [AIStore configuration](ais/setup/config.sh)).
+To switch from HTTP protocol to an encrypted HTTPS, configure `use_https`=`true` and modify `server_certificate` and `server_key` values so they point to your OpenSSL certificate and key files respectively (see [AIStore configuration](../ais/setup/config.sh)).
 
 ### Filesystem Health Checker
 
-Default installation enables filesystem health checker component called FSHC. FSHC can be also disabled via section "fschecker" of the [configuration](ais/setup/config.sh).
+Default installation enables filesystem health checker component called FSHC. FSHC can be also disabled via section "fshc" of the [configuration](../ais/setup/config.sh).
 
 When enabled, FSHC gets notified on every I/O error upon which it performs extensive checks on the corresponding local filesystem. One possible outcome of this health-checking process is that FSHC disables the faulty filesystems leaving the target with one filesystem less to distribute incoming data.
 
-Please see [FSHC readme](health/fshc.md) for further details.
+Please see [FSHC readme](../health/fshc.md) for further details.
 
 ### Networking
 
-In addition to user-accessible public network, AIStore will optionally make use of the two other networks: internal (or intra-cluster) and replication. If configured via the [netconfig section of the configuration](ais/setup/config.sh), the intra-cluster network is utilized for latency-sensitive control plane communications including keep-alive and [metasync](docs/ha.md#metasync). The replication network is used, as the name implies, for a variety of replication workloads.
+In addition to user-accessible public network, AIStore will optionally make use of the two other networks: internal (or intra-cluster) and replication. If configured via the [netconfig section of the configuration](../ais/setup/config.sh), the intra-cluster network is utilized for latency-sensitive control plane communications including keep-alive and [metasync](../docs/ha.md#metasync). The replication network is used, as the name implies, for a variety of replication workloads.
 
-All the 3 (three) networking options are enumerated [here](cmn/network.go).
+All the 3 (three) networking options are enumerated [here](../cmn/network.go).
 
 ### Reverse proxy
 
-AIStore gateway can act as a reverse proxy vis-à-vis AIStore storage targets. As of the version 2.0, this functionality is limited to GET requests only and must be used with caution and consideration. Related [configuration variable](ais/setup/config.sh) is called `rproxy` - see sub-section `http` of the section `netconfig`. To eliminate HTTP redirects, simply set the `rproxy` value to `target` (`rproxy`: `target`).
+AIStore gateway can act as a reverse proxy vis-à-vis AIStore storage targets. As of the version 2.0, this functionality is limited to GET requests only and must be used with caution and consideration. Related [configuration variable](../ais/setup/config.sh) is called `rproxy` - see sub-section `http` of the section `netconfig`. For further details, please refer to [this readme](../docs/rproxy.md).

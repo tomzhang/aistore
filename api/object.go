@@ -8,10 +8,8 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"time"
 
@@ -194,8 +192,8 @@ func PutObject(baseParams *BaseParams, bucket, object, hash string, reader cmn.R
 	defer handle.Close()
 
 	path := cmn.URLPath(cmn.Version, cmn.Objects, bucket, object)
-	url := baseParams.URL + path
-	req, err := http.NewRequest(http.MethodPut, url, handle)
+	reqURL := baseParams.URL + path
+	req, err := http.NewRequest(http.MethodPut, reqURL, handle)
 	if err != nil {
 		return fmt.Errorf("Failed to create new HTTP request, err: %v", err)
 	}
@@ -215,24 +213,9 @@ func PutObject(baseParams *BaseParams, bucket, object, hash string, reader cmn.R
 
 	resp, err := baseParams.Client.Do(req)
 	if err != nil {
-		// TODO: experimental. Some tests that do high load on server fail with
-		// 'broken pipe'. Retry helps but we need to make it more generic than
-		// just fixing tests. First, we need to be sure that we catch the
-		// correct error and retry here help. If it helps, the code block
-		// below will be removed, as well as all Printf's
-		{
-			fmt.Printf("Request failed with error: %v (%T)\n", err, err)
-			if nerr, ok := err.(*net.OpError); ok {
-				fmt.Printf("  The internal error is: %v (%T)\n", nerr.Err, nerr.Err)
-			}
-			if serr, ok := err.(*os.SyscallError); ok {
-				fmt.Printf("  The internal error is: %v (%T)\n", serr.Err, serr.Err)
-			}
-		}
-		if cmn.ShouldRetry(err) {
+		if cmn.IsErrBrokenPipe(err) || cmn.IsErrConnectionRefused(err) {
 			for i := 0; i < httpMaxRetries && err != nil; i++ {
 				time.Sleep(httpRetrySleep)
-				fmt.Printf("   retrying %d...\n", i+1)
 				resp, err = baseParams.Client.Do(req)
 			}
 		}
@@ -278,6 +261,69 @@ func ReplicateObject(baseParams *BaseParams, bucket, object string) error {
 	}
 	baseParams.Method = http.MethodPost
 	path := cmn.URLPath(cmn.Version, cmn.Objects, bucket, object)
+	_, err = DoHTTPRequest(baseParams, path, msg)
+	return err
+}
+
+func DownloadObject(baseParams *BaseParams, bucket, objname, link string) error {
+	body := cmn.DlBody{
+		Objname: objname,
+		Link:    link,
+	}
+	body.Bucket = bucket
+	msg, err := jsoniter.Marshal(body)
+	if err != nil {
+		return err
+	}
+	baseParams.Method = http.MethodPost
+	path := cmn.URLPath(cmn.Version, cmn.Download, cmn.DownloadSingle)
+	_, err = DoHTTPRequest(baseParams, path, msg)
+	return err
+}
+
+func DownloadObjectMulti(baseParams *BaseParams, bucket string, m map[string]string) error {
+	body := cmn.DlMultiBody{
+		ObjectMap: m,
+	}
+	body.Bucket = bucket
+	msg, err := jsoniter.Marshal(body)
+	if err != nil {
+		return err
+	}
+	baseParams.Method = http.MethodPost
+	path := cmn.URLPath(cmn.Version, cmn.Download, cmn.DownloadMulti)
+	_, err = DoHTTPRequest(baseParams, path, msg)
+	return err
+}
+
+func DownloadObjectStatus(baseParams *BaseParams, bucket, objname, link string) (resp []byte, err error) {
+	body := cmn.DlBody{
+		Objname: objname,
+		Link:    link,
+	}
+	body.Bucket = bucket
+	msg, err := jsoniter.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	baseParams.Method = http.MethodGet
+	path := cmn.URLPath(cmn.Version, cmn.Download)
+	resp, err = DoHTTPRequest(baseParams, path, msg)
+	return resp, err
+}
+
+func DownloadObjectCancel(baseParams *BaseParams, bucket, objname, link string) error {
+	body := cmn.DlBody{
+		Objname: objname,
+		Link:    link,
+	}
+	body.Bucket = bucket
+	msg, err := jsoniter.Marshal(body)
+	if err != nil {
+		return err
+	}
+	baseParams.Method = http.MethodDelete
+	path := cmn.URLPath(cmn.Version, cmn.Download)
 	_, err = DoHTTPRequest(baseParams, path, msg)
 	return err
 }

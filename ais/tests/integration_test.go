@@ -96,7 +96,7 @@ func TestGetAndReRegisterInParallel(t *testing.T) {
 		err error
 		m   = metadata{
 			t:               t,
-			delay:           18 * time.Second,
+			delay:           10 * time.Second,
 			num:             num,
 			numGetsEachFile: 5,
 			repFilenameCh:   make(chan repFile, num),
@@ -629,7 +629,6 @@ func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
 		md = metadata{
 			t:               t,
 			num:             num,
-			delay:           time.Second * 10,
 			numGetsEachFile: 10,
 			repFilenameCh:   make(chan repFile, num),
 			semaphore:       make(chan struct{}, 10), // 10 concurrent GET requests at a time
@@ -713,6 +712,9 @@ func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
 	go func() {
 		doGetsInParallel(&md)
 	}()
+
+	// Let's give gets some momentum
+	time.Sleep(time.Second * 4)
 
 	// register a new target
 	err = tutils.RegisterTarget(md.proxyURL, killTarget, md.smap)
@@ -1511,6 +1513,10 @@ func TestDisableAndEnableMountpath(t *testing.T) {
 	if len(mountpaths.Disabled) != 0 {
 		t.Fatalf("Not all disabled mountpaths were enabled")
 	}
+
+	tutils.Logf("Waiting for local bucket %s appears on all targets\n", m.bucket)
+	err = tutils.WaitForLocalBucket(m.proxyURL, m.bucket, true /*exists*/)
+	tutils.CheckFatal(err, t)
 
 	// Put and read random files
 	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)

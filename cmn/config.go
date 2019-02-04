@@ -238,11 +238,19 @@ type ProxyConf struct {
 }
 
 type LRUConf struct {
-	// LowWM: Self-throttling mechanisms are suspended if disk utilization is below LowWM
+	// LowWM: used capacity low-watermark (% of total local storage capacity)
 	LowWM int64 `json:"lowwm"`
 
-	// HighWM: Self-throttling mechanisms are fully engaged if disk utilization is above HighWM
+	// HighWM: used capacity high-watermark (% of total local storage capacity)
+	// NOTE:
+	// - LRU starts evicting objects when the currently used capacity (used-cap) gets above HighWM
+	// - and keeps evicting objects until the used-cap gets below LowWM
+	// - while self-throttling itself in accordance with target utilization
 	HighWM int64 `json:"highwm"`
+
+	// Out-of-Space: if exceeded, the target starts failing new PUTs and keeps
+	// failing them until its local used-cap gets back below HighWM (see above)
+	OOS int64 `json:"out_of_space"`
 
 	// AtimeCacheMax represents the maximum number of entries
 	AtimeCacheMax int64 `json:"atime_cache_max"`
@@ -298,6 +306,10 @@ type CksumConf struct {
 	// and checksum are checked. If either value fail to match, the object
 	// is removed from local storage
 	ValidateWarmGet bool `json:"validate_checksum_warm_get"`
+
+	// ValidateClusterMigration determines if the migrated objects across single cluster
+	// should have their checksum validated.
+	ValidateClusterMigration bool `json:"validate_cluster_migration"`
 
 	// EnableReadRangeChecksum: Return read range checksum otherwise return entire object checksum
 	EnableReadRangeChecksum bool `json:"enable_read_range_checksum"`
@@ -361,12 +373,14 @@ type KeepaliveTrackerConf struct {
 	IntervalStr string        `json:"interval"` // keepalives are sent(target)/checked(promary proxy) every interval
 	Interval    time.Duration `json:"-"`
 	Name        string        `json:"name"`   // "heartbeat", "average"
-	Factor      int           `json:"factor"` // "average" only
+	Factor      uint8         `json:"factor"` // only average
 }
 
 type KeepaliveConf struct {
-	Proxy  KeepaliveTrackerConf `json:"proxy"`  // how proxy tracks target keepalives
-	Target KeepaliveTrackerConf `json:"target"` // how target tracks primary proxies keepalives
+	Proxy         KeepaliveTrackerConf `json:"proxy"`  // how proxy tracks target keepalives
+	Target        KeepaliveTrackerConf `json:"target"` // how target tracks primary proxies keepalives
+	RetryFactor   uint8                `json:"retry_factor"`
+	TimeoutFactor uint8                `json:"timeout_factor"`
 }
 
 //==============================
@@ -489,8 +503,8 @@ func validateConfig(config *Config) (err error) {
 		return fmt.Errorf(badfmt, config.Rebalance.DestRetryTimeStr, err)
 	}
 
-	hwm, lwm := lru.HighWM, lru.LowWM
-	if hwm <= 0 || lwm <= 0 || hwm < lwm || lwm > 100 || hwm > 100 {
+	hwm, lwm, oos := lru.HighWM, lru.LowWM, lru.OOS
+	if hwm <= 0 || lwm <= 0 || oos <= 0 || hwm < lwm || oos < hwm || lwm > 100 || hwm > 100 || oos > 100 {
 		return fmt.Errorf("Invalid LRU configuration %+v", lru)
 	}
 	if mirror.MirrorUtilThresh < 0 || mirror.MirrorUtilThresh > 100 || mirror.MirrorBurst < 0 {

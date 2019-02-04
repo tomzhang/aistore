@@ -4,7 +4,15 @@
  */
 package cluster
 
-import "github.com/NVIDIA/aistore/cmn"
+import (
+	"github.com/NVIDIA/aistore/cmn"
+)
+
+// interface to Get current bucket-metadata instance
+// (for implementation, see ais/bucketmeta.go)
+type Bowner interface {
+	Get() (bmd *BMD)
+}
 
 // - BMD represents buckets (that store objects) and associated metadata
 // - BMD (instance) can be obtained via Bowner.Get()
@@ -38,10 +46,4 @@ func (m *BMD) LRUenabled(bucket string) bool {
 		return cmn.GCO.Get().LRU.LRUEnabled
 	}
 	return p.LRUEnabled
-}
-
-// interface to Get current bucket-metadata instance
-// (for implementation, see ais/bucketmeta.go)
-type Bowner interface {
-	Get() (bucketmd *BMD)
 }

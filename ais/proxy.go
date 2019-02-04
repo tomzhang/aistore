@@ -31,7 +31,11 @@ import (
 	jsoniter "github.com/json-iterator/go"
 )
 
-const tokenStart = "Bearer"
+const (
+	internalPageSize = 10000 // number of objects in a page for internal call between target and proxy to get atime/iscached
+
+	tokenStart = "Bearer"
+)
 
 type ClusterMountpathsRaw struct {
 	Targets map[string]jsoniter.RawMessage `json:"targets"`
@@ -130,6 +134,7 @@ func (p *proxyrunner) Run() error {
 		p.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Objects)+"/", p.objectHandler)
 	}
 
+	p.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Download), p.downloadHandler)
 	p.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Daemon), p.daemonHandler)
 	p.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Cluster), p.clusterHandler)
 	p.registerPublicNetHandler(cmn.URLPath(cmn.Version, cmn.Tokens), p.tokenHandler)
@@ -171,7 +176,7 @@ func (p *proxyrunner) Run() error {
 	}
 	p.starttime = time.Now()
 
-	dsort.RegisterNode(p.smapowner, p.si, nil)
+	dsort.RegisterNode(p.smapowner, p.si, nil, nil)
 	return p.httprunner.run()
 }
 
@@ -546,6 +551,31 @@ func (p *proxyrunner) healthHandler(w http.ResponseWriter, r *http.Request) {
 	p.writeJSON(w, r, jsbytes, "proxycorestats")
 }
 
+func (p *proxyrunner) createLocalBucket(msg cmn.ActionMsg, bucket string) error {
+	config := cmn.GCO.Get()
+
+	p.bmdowner.Lock()
+	clone := p.bmdowner.get().clone()
+	bucketProps := &cmn.BucketProps{
+		CksumConf:  cmn.CksumConf{Checksum: cmn.ChecksumInherit},
+		LRUConf:    cmn.GCO.Get().LRU,
+		MirrorConf: config.Mirror,
+	}
+	if !clone.add(bucket, true, bucketProps) {
+		p.bmdowner.Unlock()
+		return fmt.Errorf("Local bucket %s already exists", bucket)
+	}
+	if errstr := p.savebmdconf(clone, config); errstr != "" {
+		p.bmdowner.Unlock()
+		return errors.New(errstr)
+	}
+	p.bmdowner.put(clone)
+	p.bmdowner.Unlock()
+	msg.Action = path.Join(msg.Action, bucket)
+	p.metasyncer.sync(true, clone, &msg)
+	return nil
+}
+
 // POST { action } /v1/buckets/bucket-name
 func (p *proxyrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
@@ -567,35 +597,16 @@ func (p *proxyrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 		if p.forwardCP(w, r, &msg, bucket, nil) {
 			return
 		}
-		p.bmdowner.Lock()
-		clone := p.bmdowner.get().clone()
-		bprops := cmn.BucketProps{
-			CksumConf:  cmn.CksumConf{Checksum: cmn.ChecksumInherit},
-			LRUConf:    config.LRU,
-			MirrorConf: config.Mirror,
+		if err := p.createLocalBucket(msg, bucket); err != nil {
+			p.invalmsghdlr(w, r, err.Error())
 		}
-		if !clone.add(bucket, true /*bucket is local*/, &bprops) {
-			p.bmdowner.Unlock()
-			p.invalmsghdlr(w, r, fmt.Sprintf("Local bucket %s already exists", bucket))
-			return
-		}
-		if errstr := p.savebmdconf(clone, config); errstr != "" {
-			p.bmdowner.Unlock()
-			p.invalmsghdlr(w, r, errstr)
-			return
-		}
-		p.bmdowner.put(clone)
-		p.bmdowner.Unlock()
-		msg.Action = path.Join(msg.Action, bucket)
-		p.metasyncer.sync(true, clone, &msg)
 	case cmn.ActRenameLB:
 		if p.forwardCP(w, r, &msg, "", nil) {
 			return
 		}
 		bucketFrom, bucketTo := bucket, msg.Name
 		if bucketFrom == "" || bucketTo == "" {
-			errstr := fmt.Sprintf("Invalid rename local bucket request: empty name %s => %s",
-				bucketFrom, bucketTo)
+			errstr := fmt.Sprintf("Invalid rename local bucket request: empty name %q or %q", bucketFrom, bucketTo)
 			p.invalmsghdlr(w, r, errstr)
 			return
 		}
@@ -603,11 +614,10 @@ func (p *proxyrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 		props, ok := clone.Get(bucketFrom, true)
 		if !ok {
 			s := fmt.Sprintf("Local bucket %s "+cmn.DoesNotExist, bucketFrom)
-			p.invalmsghdlr(w, r, s)
+			p.invalmsghdlr(w, r, s, http.StatusNotFound)
 			return
 		}
-		_, ok = clone.Get(bucketTo, true)
-		if ok {
+		if _, ok = clone.Get(bucketTo, true); ok {
 			s := fmt.Sprintf("Local bucket %s already exists", bucketTo)
 			p.invalmsghdlr(w, r, s)
 			return
@@ -703,6 +713,107 @@ func (p *proxyrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, redirecturl, http.StatusTemporaryRedirect)
 }
 
+func (p *proxyrunner) updateBucketProp(w http.ResponseWriter, r *http.Request, bucket, name, value string) {
+	if glog.V(4) {
+		glog.Infof("Updating bucket %s property %s => %s", bucket, name, value)
+	}
+	p.bmdowner.Lock()
+	clone := p.bmdowner.get().clone()
+	isLocal := clone.IsLocal(bucket)
+	config := cmn.GCO.Get()
+
+	bprops, exists := clone.Get(bucket, isLocal)
+	if !exists {
+		cmn.Assert(!isLocal)
+		bprops = &cmn.BucketProps{
+			CksumConf:  cmn.CksumConf{Checksum: cmn.ChecksumInherit},
+			LRUConf:    config.LRU,
+			MirrorConf: config.Mirror,
+		}
+		clone.add(bucket, false /* bucket is local */, bprops)
+	}
+
+	// HTTP headers display property names title-cased, so LRULowWM turns Lrulowwm
+	// A client may read and then write new values as is, so we have to support all cases
+	errStr := ""
+	errFmt := "Invalid %s value %q: %v"
+	propName := strings.ToLower(name)
+	switch propName {
+	case cmn.HeaderBucketECEnabled:
+		if v, err := strconv.ParseBool(value); err == nil {
+			if v {
+				if bprops.DataSlices == 0 {
+					bprops.DataSlices = 2
+				}
+				if bprops.ParitySlices == 0 {
+					bprops.ParitySlices = 2
+				}
+			}
+			bprops.ECEnabled = v
+		} else {
+			errStr = fmt.Sprintf(errFmt, propName, err)
+		}
+	case cmn.HeaderBucketECData:
+		if v, err := cmn.ParseIntRanged(value, 10, 32, 1, 32); err == nil {
+			bprops.DataSlices = int(v)
+		} else {
+			errStr = fmt.Sprintf(errFmt, propName, value, err)
+		}
+	case cmn.HeaderBucketECParity:
+		if v, err := cmn.ParseIntRanged(value, 10, 32, 1, 32); err == nil {
+			bprops.ParitySlices = int(v)
+		} else {
+			errStr = fmt.Sprintf(errFmt, propName, value, err)
+		}
+	case cmn.HeaderBucketECMinSize:
+		if v, err := strconv.ParseInt(value, 10, 64); err == nil {
+			bprops.ECObjSizeLimit = v
+		} else {
+			errStr = fmt.Sprintf(errFmt, propName, value, err)
+		}
+	case cmn.HeaderBucketCopies:
+		if v, err := cmn.ParseIntRanged(value, 10, 32, 2, 2); err == nil {
+			bprops.Copies = v
+		} else {
+			errStr = fmt.Sprintf(errFmt, propName, value, err)
+		}
+	case cmn.HeaderBucketMirrorThresh:
+		if v, err := cmn.ParseIntRanged(value, 10, 64, 0, 100); err == nil {
+			bprops.MirrorUtilThresh = v
+		} else {
+			errStr = fmt.Sprintf(errFmt, propName, value, err)
+		}
+	case cmn.HeaderBucketMirrorEnabled:
+		if v, err := strconv.ParseBool(value); err == nil {
+			if v {
+				if bprops.Copies == 0 {
+					bprops.Copies = 2
+				}
+			}
+			bprops.MirrorEnabled = v
+		} else {
+			errStr = fmt.Sprintf(errFmt, propName, value, err)
+		}
+	default:
+		errStr = fmt.Sprintf("Changing property %s is not supported", name)
+	}
+
+	if errStr != "" {
+		p.bmdowner.Unlock()
+		p.invalmsghdlr(w, r, errStr)
+		return
+	}
+
+	clone.set(bucket, isLocal, bprops)
+	if e := p.savebmdconf(clone, config); e != "" {
+		glog.Errorln(e)
+	}
+	p.bmdowner.put(clone)
+	p.bmdowner.Unlock()
+	msg := cmn.ActionMsg{Action: cmn.ActSetProps}
+	p.metasyncer.sync(true, clone, &msg)
+}
+
 // PUT /v1/buckets/bucket-name
 func (p *proxyrunner) httpbckput(w http.ResponseWriter, r *http.Request) {
 	apitems, err := p.checkRESTItems(w, r, 1, false, cmn.Version, cmn.Buckets)
@@ -713,11 +824,31 @@ func (p *proxyrunner) httpbckput(w http.ResponseWriter, r *http.Request) {
 	if !p.validatebckname(w, r, bucket) {
 		return
 	}
-	nprops := &cmn.BucketProps{} // every field has to have zero value
-	msg := cmn.ActionMsg{Value: nprops}
-	if cmn.ReadJSON(w, r, &msg) != nil {
+
+	b, _, err := cmn.ReadBytes(r)
+	if err != nil {
 		return
 	}
+
+	msg := cmn.ActionMsg{}
+	// First, check if it is a single string value. If this unmarshalling fails
+	// or parsed value is not a string, it falls through to the next case
+	if err = jsoniter.Unmarshal(b, &msg); err == nil {
+		if st, ok := msg.Value.(string); ok && msg.Action == cmn.ActSetProps {
+			p.updateBucketProp(w, r, bucket, msg.Name, st)
+			return
+		}
+	}
+
+	// Second, try to treat it as a cmn.BucketProps
+	nprops := &cmn.BucketProps{} // every field has to have zero value
+	msg = cmn.ActionMsg{Value: nprops}
+	if err = jsoniter.Unmarshal(b, &msg); err != nil {
+		s := fmt.Sprintf("Failed to unmarshal: %v", err)
+		p.invalmsghdlr(w, r, s)
+		return
+	}
+
 	if msg.Action != cmn.ActSetProps && msg.Action != cmn.ActResetProps {
 		s := fmt.Sprintf("Invalid cmn.ActionMsg [%v] - expecting '%s' or '%s' action", msg, cmn.ActSetProps, cmn.ActResetProps)
 		p.invalmsghdlr(w, r, s)
@@ -1197,8 +1328,8 @@ func (p *proxyrunner) getLocalBucketObjects(bucket string, listmsgjson []byte) (
 		pageSize = msg.GetPageSize
 	}
 
-	if pageSize > MaxPageSize {
-		glog.Warningf("Page size(%d) for local bucket %s exceeds the limit(%d)", msg.GetPageSize, bucket, MaxPageSize)
+	if pageSize > maxPageSize {
+		glog.Warningf("Page size(%d) for local bucket %s exceeds the limit(%d)", msg.GetPageSize, bucket, maxPageSize)
 	}
 
 	smap := p.smapowner.get()
@@ -1280,8 +1411,8 @@ func (p *proxyrunner) getCloudBucketObjects(r *http.Request, bucket string, list
 	if err != nil {
 		return
 	}
-	if msg.GetPageSize > MaxPageSize {
-		glog.Warningf("Page size(%d) for cloud bucket %s exceeds the limit(%d)", msg.GetPageSize, bucket, MaxPageSize)
+	if msg.GetPageSize > maxPageSize {
+		glog.Warningf("Page size(%d) for cloud bucket %s exceeds the limit(%d)", msg.GetPageSize, bucket, maxPageSize)
 	}
 
 	// first, get the cloud object list from a random target
@@ -1548,7 +1679,6 @@ func (p *proxyrunner) checkHTTPAuth(h http.HandlerFunc) http.HandlerFunc {
 
 		h.ServeHTTP(w, r)
 	}
-
 	return wrappedFunc
 }
 

@@ -7,7 +7,7 @@
 
 ## Storage Services
 
-By default, buckets inherit [global configuration](ais/setup/config.sh). However, several distinct sections of this global configuration can be overridden at startup or at runtime on a per bucket basis. The list includes checksumming, LRU, erasure coding, and local mirroring - please see the following sections for details.
+By default, buckets inherit [global configuration](../ais/setup/config.sh). However, several distinct sections of this global configuration can be overridden at startup or at runtime on a per bucket basis. The list includes checksumming, LRU, erasure coding, and local mirroring - please see the following sections for details.
 
 ### Checksumming
 
@@ -76,6 +76,11 @@ Example of setting bucket properties:
 $ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action":"setprops","value":{"lru_props":{"lowwm":1,"highwm":100,"atime_cache_max":1,"dont_evict_time":"990m","capacity_upd_time":"90m","lru_enabled":true}, "ec_config": {"enabled": true, "data": 4, "parity": 2}}}' 'http://localhost:8080/v1/buckets/<bucket-name>'
 ```
 
+To change ony one EC property(e.g, enable or disable EC for a bucket) without touching other bucket properties, use the sinlge set property API. Example of disabling EC:
+```shell
+$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action":"setprops", "name": "ec_config-enabled", "value":"false"}' 'http://localhost:8080/v1/buckets/<bucket-name>'
+```
+
 #### Limitations
 
 In the version 2.0, once a bucket is configured for EC, it'll stay erasure coded for its entire lifetime - there is currently no supported way to change this once-applied configuration to a different (N, K) schema, disable EC, and/or remove redundant EC-generated content.
@@ -84,7 +89,7 @@ Secondly, only local buckets are currently supported. Both limitations will be r
 
 ### Local mirroring and load balancing
 
-Unlike erasure coding (above) that takes special care of distributing redundant content across *different* clustered nodes, local mirror is, as the the name implies, local. When a bucket is [configured as a mirror](ais/setup/config.sh), objects placed into this bucket get locally replicated and the replicas are stored on a local filesystems that are different from those that store the original. In other words, a mirrorred bucket will survive a loss of any (one) local drive.
+Unlike erasure coding (above) that takes special care of distributing redundant content across *different* clustered nodes, local mirror is, as the the name implies, local. When a bucket is [configured as a mirror](../ais/setup/config.sh), objects placed into this bucket get locally replicated and the replicas are stored on a local filesystems that are different from those that store the original. In other words, a mirrorred bucket will survive a loss of any (one) local drive.
 
 >> The last statement is especially true when local filesystems are non-redundant. As a side, note that AIS storage targets can be deployed to utilize Linux LVMs that (themselves) provide a variety of RAID/mirror schemas.
 
@@ -93,10 +98,15 @@ Further, as of v2.0 the capability entails:
 * at PUT time: asynchronously generate local replicas while trying to minimize the interference with user workloads
 * at GET time: given 2 (two) choices, select the least loaded drive or drives that store the requested object
 
-Finally, all accumulated redundant content can be (asynchronously) destroyed at any time via specific [extended action](docs/xaction.md) called [erasecopies](cmn/api.go). And as always, the same can be achieved via the following `curl`:
+Finally, all accumulated redundant content can be (asynchronously) destroyed at any time via specific [extended action](../docs/xaction.md) called [erasecopies](../cmn/api.go). And as always, the same can be achieved via the following `curl`:
 
 ```shell
 $ curl -i -X POST -H 'Content-Type: application/json' -d '{"action":"erasecopies"}' http://localhost:8080/v1/buckets/abc
+```
+
+To change ony one mirroring property without touching other bucket properties, use the sinlge set property API. Example of disabling mirroring:
+```shell
+$ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action":"setprops", "name": "mirror-mirror_enabled", "value":"false"}' 'http://localhost:8080/v1/buckets/<bucket-name>'
 ```
 
 >> The `curl` example above uses gateway's URL `localhost:8080` and bucket named `abc` as an example...

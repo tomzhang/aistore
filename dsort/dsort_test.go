@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/aistore/3rdparty/golang/mux"
 	"github.com/NVIDIA/aistore/cluster"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/dsort/extract"
@@ -66,8 +67,7 @@ type testSmapListeners struct {
 	sync.RWMutex
 }
 
-func (a *testSmapListeners) Reg(sl cluster.Slistener) {}
-
+func (a *testSmapListeners) Reg(sl cluster.Slistener)   {}
 func (a *testSmapListeners) Unreg(sl cluster.Slistener) {}
 
 type testSmap struct {
@@ -125,9 +125,9 @@ func (ec *extractCreatorMock) CreateShard(s *extract.Shard, w io.Writer, loadCon
 func (ec *extractCreatorMock) UsingCompression() bool { return ec.useCompression }
 func (ec *extractCreatorMock) MetadataSize() int64    { return 0 }
 
-type targetMock struct {
+type targetNodeMock struct {
 	daemonID  string
-	mux       *http.ServeMux
+	mux       *mux.ServeMux
 	s         *http.Server
 	controlCh chan error
 	managers  *ManagerGroup
@@ -135,13 +135,13 @@ type targetMock struct {
 
 type testContext struct {
 	targetCnt int
-	targets   []*targetMock
+	targets   []*targetNodeMock
 	smap      *testSmap
 	errCh     chan error
 	wg        *sync.WaitGroup
 }
 
-func newTargetMock(daemonID string, smap *testSmap) *targetMock {
+func newTargetMock(daemonID string, smap *testSmap) *targetNodeMock {
 	// Initialize dsort manager
 	rs := &ParsedRequestSpec{
 		Extension: extTar,
@@ -158,7 +158,7 @@ func newTargetMock(daemonID string, smap *testSmap) *targetMock {
 	dsortManager.unlock()
 
 	net := smap.GetTarget(daemonID).PublicNet
-	return &targetMock{
+	return &targetNodeMock{
 		daemonID: daemonID,
 		s: &http.Server{
 			Addr:    fmt.Sprintf("%s:%s", net.NodeIPAddr, net.DaemonPort),
@@ -169,8 +169,8 @@ func newTargetMock(daemonID string, smap *testSmap) *targetMock {
 	}
 }
 
-func (t *targetMock) setHandlers(handlers map[string]http.HandlerFunc) {
-	mux := http.NewServeMux()
+func (t *targetNodeMock) setHandlers(handlers map[string]http.HandlerFunc) {
+	mux := mux.NewServeMux()
 	for path, handler := range handlers {
 		mux.HandleFunc(path, handler)
 	}
@@ -179,7 +179,7 @@ func (t *targetMock) setHandlers(handlers map[string]http.HandlerFunc) {
 	t.s.Handler = mux
 }
 
-func (t *targetMock) setup() {
+func (t *targetNodeMock) setup() {
 	// set default handlers
 	defaultHandlers := map[string]http.HandlerFunc{
 		cmn.URLPath(cmn.Version, cmn.Sort, cmn.Records) + "/": func(w http.ResponseWriter, r *http.Request) {
@@ -194,13 +194,13 @@ func (t *targetMock) setup() {
 	}()
 }
 
-func (t *targetMock) beforeTeardown() {
+func (t *targetNodeMock) beforeTeardown() {
 	manager, _ := t.managers.Get(globalManagerUUID)
 	manager.setInProgressTo(false)
 	manager.cleanup()
 }
 
-func (t *targetMock) teardown() {
+func (t *targetNodeMock) teardown() {
 	t.s.Close()
 	Expect(<-t.controlCh).To(Equal(http.ErrServerClosed))
 }
@@ -244,7 +244,7 @@ func (tctx *testContext) setup() {
 	}
 
 	// Create and setup target mocks
-	targets := make([]*targetMock, tctx.targetCnt)
+	targets := make([]*targetNodeMock, tctx.targetCnt)
 	for i := 0; i < tctx.targetCnt; i++ {
 		target := newTargetMock(genNodeID(i), smap)
 		target.setup()
@@ -255,8 +255,9 @@ func (tctx *testContext) setup() {
 	// that we close server faster than it starts and many bad things can happen.
 	time.Sleep(time.Millisecond * 100)
 
-	ctx.nameLocker = &nameLockerMock{}
 	ctx.smap = smap
+	ctx.t = cluster.NewTargetMock(nil)
+	ctx.nameLocker = &nameLockerMock{}
 	tctx.smap = smap
 	tctx.targets = targets
 }
@@ -285,7 +286,7 @@ var _ = Describe("Distributed Sort", func() {
 
 				for _, target := range ctx.targets {
 					ctx.wg.Add(1)
-					go func(target *targetMock) {
+					go func(target *targetNodeMock) {
 						defer ctx.wg.Done()
 
 						targetOrder := randomTargetOrder(1, ctx.smap.Tmap)
@@ -374,7 +375,7 @@ var _ = Describe("Distributed Sort", func() {
 
 					for _, target := range tctx.targets {
 						tctx.wg.Add(1)
-						go func(target *targetMock) {
+						go func(target *targetNodeMock) {
 							defer tctx.wg.Done()
 
 							// For each target add sorted record
@@ -442,7 +443,7 @@ var _ = Describe("Distributed Sort", func() {
 
 					for _, target := range tctx.targets {
 						tctx.wg.Add(1)
-						go func(target *targetMock) {
+						go func(target *targetNodeMock) {
 							manager, exists := target.managers.Get(globalManagerUUID)
 							Expect(exists).To(BeTrue())
 
@@ -595,7 +596,7 @@ var _ = Describe("Distributed Sort", func() {
 
 				for _, target := range tctx.targets {
 					tctx.wg.Add(1)
-					go func(target *targetMock) {
+					go func(target *targetNodeMock) {
 						defer tctx.wg.Done()
 						manager, exists := target.managers.Get(globalManagerUUID)
 						Expect(exists).To(BeTrue())
